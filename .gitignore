@@ -1,0 +1,8 @@
+model_config.yaml
+!model_config.template.yaml
+.states
+*.py[cod]
+__pycache__/
+*.db
+assets/external/
+.web
