@@ -50,6 +50,9 @@ class ChatState(rx.State):
     # Keep track of waiting for input state
     waiting_for_input: bool = False
     
+    # Control whether the input box is enabled
+    input_enabled: bool = True
+    
     # WebSocket request tracking
     current_request_id: Optional[str] = None
     
@@ -96,6 +99,7 @@ class ChatState(rx.State):
         async with self:
             self.current_message = ""
             self.processing = True  # Set processing flag
+            self.input_enabled = False  # Disable input while processing
         
         # Get team manager instance
         team_manager = TeamManager.get_instance()
@@ -133,6 +137,7 @@ class ChatState(rx.State):
                 type="TextMessage"
             )
             self.messages = self.messages + [user_message]
+            self.input_enabled = False  # Disable input while chat is processing
             logger.debug(f"Added user message before starting chat")
         yield ChatState.start_chat(message)
 
@@ -168,6 +173,18 @@ class ChatState(rx.State):
                     continue
                     
                 if hasattr(event, "source") and hasattr(event, "content"):
+                    # Skip duplicate user messages - the first message in the stream will be the user's initial message
+                    # which we've already added to the chat when submitting
+                    if event.source == "user" and event.content == initial_message:
+                        logger.debug(f"Skipping duplicate user message: {event.content[:30]}...")
+                        continue
+                        
+                    # Check for "Enter your response" or similar prompts and enable input
+                    if event.source == "system" and "Enter your response" in event.content:
+                        logger.debug("Detected 'Enter your response' prompt, enabling input")
+                        async with self:
+                            self.input_enabled = True
+                            continue  # Skip adding this message to the chat
                     # Extract metadata if available
                     metadata = {}
                     if hasattr(event, "metadata"):
@@ -233,6 +250,7 @@ class ChatState(rx.State):
             async with self:
                 self.processing = False
                 self.chat_ongoing = False
+                self.input_enabled = True
                 
             # Clean up team using TeamManager
             team_manager = TeamManager.get_instance()
@@ -262,6 +280,7 @@ class ChatState(rx.State):
             self.processing = False
             self.chat_ongoing = False
             self.current_request_id = None
+            self.input_enabled = True  # Re-enable input after cancellation
 
     @rx.event
     def on_message_input(self, value: str):

@@ -111,7 +111,7 @@ def action_bar() -> rx.Component:
                 rx.button(
                     "Send",
                     on_click=ChatState.submit_message,
-                    is_disabled=ChatState.processing & ~ChatState.waiting_for_input,
+                    is_disabled=~ChatState.input_enabled,
                 ),
                 width="100%",
                 max_width="50em",
