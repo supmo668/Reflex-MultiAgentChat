@@ -10,12 +10,8 @@ import aiofiles
 
 from autogen_agentchat.base import TaskResult
 from autogen_agentchat.messages import TextMessage, UserInputRequestedEvent
-from autogen_agentchat.teams._group_chat._events import GroupChatError, GroupChatPause
 
-from autogen_core import CancellationToken
-
-from ..websocket_handlers import input_ws_manager
-from ..team_manager import TeamManager
+from .team_manager import TeamManager
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -40,24 +36,28 @@ class ChatState(rx.State):
     
     # Whether we are processing a message
     processing: bool = False
-    chat_ongoing: bool = False
     # The current message being typed
     current_message: str = ""
     
     # The team state as a dictionary
     team_state: dict = {}
     
-    # Keep track of waiting for input state
-    waiting_for_input: bool = False
-    
     # Control whether the input box is enabled
     input_enabled: bool = True
-    
+
     # WebSocket request tracking
     current_request_id: Optional[str] = None
     
     # Team instance ID to ensure we use the same team
     team_id: str = str(uuid4())
+    
+    # Helper method to reset team ID
+    def _reset_team_id(self) -> str:
+        """Reset the team ID to a new UUID and return it."""
+        new_id = str(uuid4())
+        self.team_id = new_id
+        logger.debug(f"Reset team_id to new value: {new_id}")
+        return new_id
 
     async def get_team(self):
         """Get or create the team of agents using the TeamManager.
@@ -69,15 +69,29 @@ class ChatState(rx.State):
         # Get the team from the manager
         team_manager = TeamManager.get_instance()
         
+        # Ensure we have a valid team_id
+        if not self.team_id or len(self.team_id) < 5:  # Basic validation
+            async with self:
+                old_id = self.team_id
+                self._reset_team_id()
+                logger.debug(f"Invalid team_id in get_team: {old_id}, reset to: {self.team_id}")
+        
         # Define a callback to update UI state when messages are received
         async def update_state_callback(prompt: str, is_user_input: bool = False):
             if prompt.strip():
+                # Check for "Enter your response" prompts
+                if "Enter your response" in prompt:
+                    logger.debug("Detected 'Enter your response' prompt, enabling input without adding message")
+                    async with self:
+                        self.processing = False
+                        self.input_enabled = True
+                    return
+                
                 async with self:
                     message_type = "system"
                     if is_user_input:
-                        self.waiting_for_input = True
                         self.processing = False
-                    
+                    # Add system message to UI
                     system_message = QA(
                         source="system",
                         content=prompt,
@@ -90,78 +104,133 @@ class ChatState(rx.State):
 
     @rx.event(background=True)
     async def submit_message(self):
-        """Submit a message to the team."""
+        """Submit a message to the team.
+        Don't add message here, add it in start_chat at `run_stream` iteration
+        """
+        logger.debug("=== SUBMIT_MESSAGE CALLED ===")
         if not self.current_message:
+            logger.debug("No current message, returning early")
             return
             
         # Get the message and clear input
         message = self.current_message
+        logger.debug(f"Processing message: '{message[:30]}...'")
+        
+        # Add user message to UI first to ensure it's visible
         async with self:
             self.current_message = ""
             self.processing = True  # Set processing flag
             self.input_enabled = False  # Disable input while processing
-        
+            logger.debug(f"State updated: processing={self.processing}, input_enabled={self.input_enabled}")
+            
         # Get team manager instance
         team_manager = TeamManager.get_instance()
         
-        # Check if a team is already waiting for input
-        if self.team_id and await team_manager.is_team_waiting_for_input(self.team_id):
-            logger.debug(f"Team {self.team_id} is waiting for input, submitting message: {message}")
-            
-            # Add user message to the chat first
-            async with self:
-                user_message = QA(
-                    content=message,
-                    source="user",
-                    type="TextMessage"
-                )
-                self.messages = self.messages + [user_message]
-                logger.debug(f"Added user message: {user_message}")
-            
-            # Submit the message to the waiting team
-            success = await team_manager.submit_user_input(self.team_id, message)
-            if success:
-                logger.debug(f"Successfully submitted message to team {self.team_id}")
-                return
-            else:
-                logger.error(f"Failed to submit message to team {self.team_id}")
-                # Continue to start a new chat as fallback
+        # After cancellation, we should have a fresh team_id from _reset_team_id()
+        # Log the current team_id for debugging
+        logger.debug(f"Current team_id: {self.team_id}")
         
-        # If we reach here, either there's no ongoing chat or the team is not waiting for input
-        # Start a new chat
-        logger.debug(f"Starting new chat with message: {message}")
-        async with self:
-            user_message = QA(
-                content=message,
-                source="user",
-                type="TextMessage"
-            )
-            self.messages = self.messages + [user_message]
-            self.input_enabled = False  # Disable input while chat is processing
-            logger.debug(f"Added user message before starting chat")
-        yield ChatState.start_chat(message)
+        # Always start a new chat after cancellation
+        # We can detect this by checking if the team exists
+        is_running = False
+        try:
+            is_running = await team_manager.is_team_running(self.team_id)
+            logger.debug(f"Team is_running: {is_running}")
+        except Exception as e:
+            logger.error(f"Error checking if team is running: {str(e)}")
+            is_running = False
+        
+        if not is_running:
+            # Force start a new chat if we're after cancellation or no team is running
+            # This ensures we always get a fresh start
+            logger.debug(f"Starting new chat with message: '{message[:30]}...'")
+            logger.debug("Yielding to start_chat event")
+            try:
+                # We need to ensure a fresh team_id
+                async with self:
+                    old_id = self.team_id
+                    self._reset_team_id()
+                    logger.debug(f"Reset team_id from {old_id} to {self.team_id} before starting chat")
+                
+                yield ChatState.start_chat(message)
+                logger.debug("Successfully yielded to start_chat")
+                return
+            except Exception as e:
+                logger.error(f"Error yielding to start_chat: {str(e)}")
+                
+        # If team is running but not waiting for input, it might be in an error state
+        # Let's cancel it and start a new chat
+        is_waiting = await team_manager.is_team_waiting_for_input(self.team_id)
+        logger.debug(f"Team is_waiting: {is_waiting}")
+        if not is_waiting:
+            logger.debug(f"Team {self.team_id} is running but not waiting for input, cancelling it")
+            await team_manager.cancel_team(self.team_id)
+            # Generate a new team ID
+            async with self:
+                self._reset_team_id()
+                logger.debug(f"Reset team_id to: {self.team_id}")
+            # Start a new chat
+            logger.debug(f"Starting new chat after cancelling non-responsive team")
+            yield ChatState.start_chat(message)
+            return
+        
+        # If we reach here, the team is running and waiting for input
+        logger.debug(f"Team {self.team_id} is waiting for input, submitting message: {message[:30]}...")
+
+        # Submit the message to the waiting team
+        success = await team_manager.submit_user_input(self.team_id, message)
+        if success:
+            logger.debug(f"Successfully submitted message to team {self.team_id}")
+            return
+        else:
+            logger.error(f"Failed to submit message to team {self.team_id}")
+            # Continue to start a new chat as fallback
+            logger.debug(f"Starting new chat after failed submission")
+            yield ChatState.start_chat(message)
 
     @rx.event(background=True)
-    async def start_chat(self, initial_message: Optional[str] = None):
+    async def start_chat(self, initial_message: str):
         """Start or continue a chat conversation."""
-        logger.debug("Starting chat")
+        logger.debug(f"=== START_CHAT CALLED with message: '{initial_message[:30]}...' ===")
+        logger.debug(f"Current state: team_id={self.team_id}, processing={self.processing}, input_enabled={self.input_enabled}")
+        
+        # Force cleanup of any existing team with this ID to ensure a fresh start
+        team_manager = TeamManager.get_instance()
+        try:
+            is_running = await team_manager.is_team_running(self.team_id)
+            if is_running:
+                logger.debug(f"Found existing team with ID {self.team_id}, removing it before starting new chat")
+                await team_manager.remove_team(self.team_id)
+        except Exception as e:
+            logger.error(f"Error cleaning up existing team: {str(e)}")
         
         try:
             # Mark as processing
             async with self:
                 self.processing = True
-                self.chat_ongoing = True
+            
+            # Ensure we have a valid team_id
+            if not self.team_id or len(self.team_id) < 5:  # Basic validation
+                async with self:
+                    old_id = self.team_id
+                    self._reset_team_id()
+                    logger.debug(f"Invalid team_id: {old_id}, reset to: {self.team_id}")
             
             # Get or create team
+            logger.debug(f"Getting team with ID: {self.team_id}")
             team, termination = await self.get_team()
-            logger.debug("Got team instance")
+            logger.debug(f"Got team instance with ID: {self.team_id}")
             
             # Create initial message if provided
-            request = initial_message if initial_message else "Let's talk about sci-fi movies"
-            stream = team.run_stream(task=request)
+            logger.debug(f"Running stream with initial message: '{initial_message[:30]}...'")
+            stream = team.run_stream(task=initial_message)
+            logger.debug("Stream created, starting to process events")
             
             # Process events
+            event_count = 0
             async for event in stream:
+                event_count += 1
+                logger.debug(f"Processing event #{event_count}: {type(event).__name__}")
                 if isinstance(event, TaskResult):
                     logger.debug("Skipping TaskResult message")
                     continue
@@ -175,16 +244,14 @@ class ChatState(rx.State):
                 if hasattr(event, "source") and hasattr(event, "content"):
                     # Skip duplicate user messages - the first message in the stream will be the user's initial message
                     # which we've already added to the chat when submitting
-                    if event.source == "user" and event.content == initial_message:
-                        logger.debug(f"Skipping duplicate user message: {event.content[:30]}...")
-                        continue
+
                         
-                    # Check for "Enter your response" or similar prompts and enable input
+                    # Check for "Enter your response" or similar prompts
                     if event.source == "system" and "Enter your response" in event.content:
                         logger.debug("Detected 'Enter your response' prompt, enabling input")
                         async with self:
                             self.input_enabled = True
-                            continue  # Skip adding this message to the chat
+                        continue  # Skip adding this message to the chat
                     # Extract metadata if available
                     metadata = {}
                     if hasattr(event, "metadata"):
@@ -206,6 +273,8 @@ class ChatState(rx.State):
                                 }
                         except Exception as e:
                             logger.warning(f"Could not serialize models_usage: {e}")
+                    
+                    # No need to track seen messages anymore
                     
                     async with self:
                         agent_message = QA(
@@ -249,7 +318,6 @@ class ChatState(rx.State):
             # Mark as finished
             async with self:
                 self.processing = False
-                self.chat_ongoing = False
                 self.input_enabled = True
                 
             # Clean up team using TeamManager
@@ -260,28 +328,108 @@ class ChatState(rx.State):
     
     @rx.event(background=True)
     async def cancel_chat(self):
-        """Cancel the current chat."""
+        """Cancel the current chat.
+        
+        This will gracefully terminate the current chat using ExternalTermination
+        and ensure the next message starts a new chat without any errors.
+        """
+        logger.debug("=== CANCEL_CHAT CALLED ===")
+        logger.debug(f"Current state before cancellation: team_id={self.team_id}, processing={self.processing}, input_enabled={self.input_enabled}")
+        
         # Use TeamManager to cancel the team
-        # This will also cancel any active WebSocket requests
         team_manager = TeamManager.get_instance()
-        await team_manager.cancel_team(self.team_id)
-            
+        
+        # Store the old team ID for cancellation
+        team_id_to_cancel = self.team_id
+        
+        # Generate a new team ID before cancellation to ensure a clean slate
         async with self:
-            # Add cancellation message
-            cancel_message = QA(
-                content="Chat cancelled",
-                source="system",
-                type="system"
-            )
-            self.messages = self.messages + [cancel_message]
+            # Generate a new team ID for the next chat
+            new_team_id = self._reset_team_id()
+            logger.debug(f"Generated new team_id: {new_team_id} (old: {team_id_to_cancel})")
             
-            # Reset state
-            self.waiting_for_input = False
+            # Reset UI state
             self.processing = False
-            self.chat_ongoing = False
+            self.input_enabled = True
+            
+            # Clear current request ID
             self.current_request_id = None
-            self.input_enabled = True  # Re-enable input after cancellation
+            
+        # Now cancel the old team - with enhanced error handling
+        try:
+            # First check if the team is running
+            is_running = await team_manager.is_team_running(team_id_to_cancel)
+            logger.debug(f"Team {team_id_to_cancel} is_running: {is_running}")
+            
+            if is_running:
+                logger.debug(f"Cancelling team {team_id_to_cancel}")
+                # Cancel the team - this should set the termination flag and remove the team
+                await team_manager.cancel_team(team_id_to_cancel)
+                
+                # Wait a moment for cancellation to take effect
+                await asyncio.sleep(0.5)
+                
+                # Double-check the team was actually removed
+                still_running = await team_manager.is_team_running(team_id_to_cancel)
+                if still_running:
+                    logger.error(f"Team {team_id_to_cancel} still running after cancellation, forcing removal")
+                    # Force remove the team
+                    await team_manager.remove_team(team_id_to_cancel)
+                    
+                    # Final check
+                    final_check = await team_manager.is_team_running(team_id_to_cancel)
+                    logger.debug(f"Final check - team {team_id_to_cancel} still running: {final_check}")
+            else:
+                logger.debug(f"Team {team_id_to_cancel} not running, no need to cancel")
+        except Exception as e:
+            logger.error(f"Error during team cancellation: {str(e)}")
+            # Even if there's an error, try to force remove the team
+            try:
+                await team_manager.remove_team(team_id_to_cancel)
+                logger.debug(f"Force removed team {team_id_to_cancel} after error")
+            except Exception as e2:
+                logger.error(f"Error during forced team removal: {str(e2)}")
+        
+        # Final state check
+        logger.debug(f"Chat cancelled and state reset. New team_id={self.team_id}, processing={self.processing}, input_enabled={self.input_enabled}")
 
+    @rx.event(background=True)
+    async def pause_chat(self):
+        """Pause the current chat by saving its state and removing the team.
+        
+        This allows the user to start a new chat while preserving the state of the current one.
+        """
+        team_manager = TeamManager.get_instance()
+        
+        # Check if team is running before attempting to pause
+        if await team_manager.is_team_running(self.team_id):
+            # Save the team state
+            state = await team_manager.save_team_state(self.team_id)
+            
+            # Store the state
+            if state:
+                async with self:
+                    self.team_state = state
+                    logger.debug(f"Team state saved: {len(state)} bytes")
+            
+            # Now remove the team to free up resources
+            await team_manager.remove_team(self.team_id)
+            
+            # Add pause message
+            async with self:
+                pause_message = QA(
+                    content="Chat paused. You can continue with a new conversation.",
+                    source="system",
+                    type="system"
+                )
+                self.messages = self.messages + [pause_message]
+        
+        # Reset processing state regardless of whether team was running
+        async with self:
+            self.processing = False
+            self.current_request_id = None
+            self.input_enabled = True  # Re-enable input after pausing
+    
     @rx.event
     def on_message_input(self, value: str):
         """Handle message input changes.

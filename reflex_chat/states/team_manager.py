@@ -60,10 +60,16 @@ class TeamManager:
             
         Raises:
             Exception: If no input is provided or timeout
-            asyncio.CancelledError: If the input request is cancelled
+            asyncio.CancelledError: If the input request is cancelled (but this is caught by wrapped_input_func)
         """
+        request_id = None
         try:
             logger.info(f"[TEAM {team_id}] Getting user input with prompt: {prompt[:50]}...")
+            
+            # Check if cancellation is already requested
+            if cancellation_token and cancellation_token.is_cancelled():
+                logger.warning(f"[TEAM {team_id}] Cancellation already requested, not waiting for input")
+                return "[CANCELLED BY USER]"
             
             # Generate unique request ID
             request_id = str(uuid4())
@@ -83,6 +89,9 @@ class TeamManager:
                     logger.error(f"[TEAM {team_id}] Error in state update callback: {str(e)}")
             else:
                 logger.debug(f"[TEAM {team_id}] No state update callback found")
+            
+            # We'll use ExternalTermination.set() for graceful termination
+            # No need to monitor the cancellation token separately
                 
             # Wait for input using WebSocket manager
             logger.debug(f"[TEAM {team_id}] Waiting for input via WebSocket with request ID: {request_id}")
@@ -99,10 +108,12 @@ class TeamManager:
             
         except asyncio.CancelledError:
             logger.warning(f"[TEAM {team_id}] Input request cancelled")
-            raise
+            # Instead of re-raising, return a special message
+            # This prevents the CancelledError from propagating
+            return "[CANCELLED BY USER]"
         except Exception as e:
             logger.error(f"[TEAM {team_id}] Error getting user input: {str(e)}")
-            raise
+            return f"[ERROR: {str(e)}]"
         finally:
             # Clear the request ID
             if team_id in self._current_request_ids:
@@ -154,12 +165,15 @@ class TeamManager:
                     logger.warning(f"[TEAM {team_id}] Input function cancelled")
                     # Set termination flag for graceful shutdown
                     termination.set()
-                    raise
+                    # Instead of re-raising, return a special message
+                    # This prevents the CancelledError from propagating to AutoGen
+                    return "[CANCELLED BY USER]"
                 except Exception as e:
                     logger.error(f"[TEAM {team_id}] Error in input function: {str(e)}")
                     # If any exception occurs, set termination flag for graceful shutdown
                     termination.set()
-                    raise
+                    # Return a message instead of raising
+                    return f"[ERROR: {str(e)}]"
             
             # Create agents
             assistant = AssistantAgent(
@@ -171,7 +185,7 @@ class TeamManager:
             yoda = AssistantAgent(
                 name="yoda",
                 model_client=model_client,
-                system_message="Repeat the same message in the tone of Yoda.",
+                system_message="You are Yoda from Star Wars. Speak, think and act as Yoda.",
             )
             
             user_proxy = UserProxyAgent(
@@ -210,21 +224,83 @@ class TeamManager:
         Returns:
             True if team was found and cancelled, False otherwise
         """
+        logger.debug(f"=== CANCEL_TEAM CALLED for team_id {team_id} ===")
+        
+        # First, check if the team exists outside the lock to avoid deadlocks
+        team_exists = False
         async with self._lock:
-            # Cancel any active WebSocket request
-            if team_id in self._current_request_ids and self._current_request_ids[team_id]:
-                request_id = self._current_request_ids[team_id]
-                logger.debug(f"Cancelling WebSocket request {request_id} for team {team_id}")
-                await input_ws_manager.disconnect(request_id)
-                self._current_request_ids[team_id] = None
+            team_exists = team_id in self._teams
             
-            # Set termination condition
+        if not team_exists:
+            logger.debug(f"Team {team_id} not found, nothing to cancel")
+            return False
+            
+        # Get the termination object and set it first (outside the lock)
+        termination = None
+        async with self._lock:
             if team_id in self._teams:
                 logger.debug(f"Cancelling team with ID {team_id}")
                 _, termination = self._teams[team_id]
-                termination.set()
-                return True
-            return False
+        
+        if termination:
+            # Set termination condition - this signals AutoGen to terminate gracefully
+            termination.set()
+            logger.debug(f"Set termination flag for team {team_id}")
+        else:
+            logger.error(f"No termination object found for team {team_id}")
+            
+        # Add a system message through the callback if available
+        callback = None
+        async with self._lock:
+            if team_id in self._callbacks:
+                callback = self._callbacks[team_id]
+                
+        if callback:
+            try:
+                await callback("[CANCELLED BY USER]", False)
+                logger.debug(f"Sent cancellation message via callback for team {team_id}")
+            except Exception as e:
+                logger.error(f"Error sending cancellation message via callback: {e}")
+        
+        # Wait a moment for termination to take effect
+        await asyncio.sleep(0.5)  # Increased wait time
+        
+        # Now cancel any active WebSocket request
+        request_id = None
+        async with self._lock:
+            if team_id in self._current_request_ids and self._current_request_ids[team_id]:
+                request_id = self._current_request_ids[team_id]
+                self._current_request_ids[team_id] = None
+                
+        if request_id:
+            logger.debug(f"Cancelling WebSocket request {request_id} for team {team_id}")
+            try:
+                await input_ws_manager.disconnect(request_id)
+                logger.debug(f"Successfully disconnected WebSocket for request {request_id}")
+            except Exception as e:
+                logger.error(f"Error disconnecting WebSocket: {str(e)}")
+        
+        # Wait a bit longer for everything to clean up
+        await asyncio.sleep(0.5)  # Increased wait time
+        
+        # Force remove the team regardless of state
+        removed = await self.remove_team(team_id)
+        logger.debug(f"Team {team_id} removed: {removed}")
+        
+        # Double-check team is gone
+        still_exists = await self.is_team_running(team_id)
+        if still_exists:
+            logger.error(f"Team {team_id} still exists after removal attempt, forcing removal")
+            async with self._lock:
+                if team_id in self._teams:
+                    del self._teams[team_id]
+                if team_id in self._callbacks:
+                    del self._callbacks[team_id]
+                if team_id in self._current_request_ids:
+                    del self._current_request_ids[team_id]
+            logger.debug(f"Forced removal of team {team_id} completed")
+            
+        return True
     
     async def is_team_waiting_for_input(self, team_id: str) -> bool:
         """Check if a team is waiting for input.
@@ -282,6 +358,18 @@ class TeamManager:
                     
                 return True
             return False
+            
+    async def is_team_running(self, team_id: str) -> bool:
+        """Check if a team is currently running.
+        
+        Args:
+            team_id: ID of the team to check
+            
+        Returns:
+            True if the team exists and is running, False otherwise
+        """
+        async with self._lock:
+            return team_id in self._teams
     
     async def save_team_state(self, team_id: str) -> Optional[Dict[str, Any]]:
         """Save team state to a dictionary.
@@ -300,4 +388,39 @@ class TeamManager:
                     return state
                 except Exception as e:
                     logger.error(f"Error saving team state: {e}")
+            return None
+            
+    async def pause_team(self, team_id: str) -> Optional[Dict[str, Any]]:
+        """Pause a team by saving its state and then removing it.
+        
+        This allows a new team to be created while preserving the state of the old one.
+        
+        Args:
+            team_id: ID of the team to pause
+            
+        Returns:
+            The saved state of the team, or None if the team was not found or could not be saved
+        """
+        logger.debug(f"Pausing team with ID {team_id}")
+        
+        # First, cancel any pending input requests
+        async with self._lock:
+            if team_id in self._current_request_ids and self._current_request_ids[team_id]:
+                request_id = self._current_request_ids[team_id]
+                logger.debug(f"Cancelling WebSocket request {request_id} for team {team_id}")
+                await input_ws_manager.disconnect(request_id)
+                self._current_request_ids[team_id] = None
+        
+        # Save the team state
+        state = await self.save_team_state(team_id)
+        
+        if state:
+            logger.debug(f"Successfully saved state for team {team_id}")
+            
+            # Now remove the team to free up resources
+            await self.remove_team(team_id)
+            
+            return state
+        else:
+            logger.error(f"Failed to save state for team {team_id}")
             return None

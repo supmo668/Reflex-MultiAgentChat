@@ -76,15 +76,28 @@ def chat() -> rx.Component:
             overflow_y="auto",
             id="chat-container",
         ),
-        # Cancel button when chat is ongoing
-        rx.cond(
-            ChatState.chat_ongoing,
+        # Action buttons - Pause only when processing, Cancel always available
+        rx.hstack(
+            rx.cond(
+                ChatState.processing,
+                rx.button(
+                    "Pause Chat",
+                    on_click=ChatState.pause_chat,
+                    color_scheme="blue",
+                    margin="1em",
+                ),
+            ),
             rx.button(
                 "Cancel Chat",
                 on_click=ChatState.cancel_chat,
                 color_scheme="red",
                 margin="1em",
+                # Only disable the button if there's no active chat
+                is_disabled=~(ChatState.processing | (ChatState.messages.length() > 0)),
             ),
+            spacing="2",
+            justify="center",
+            width="100%",
         ),
         py="8",
         flex="1",
