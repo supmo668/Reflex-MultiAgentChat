@@ -100,8 +100,25 @@ class TeamManager:
             
             # Check if input was received
             if not user_input:
-                logger.error(f"[TEAM {team_id}] No input provided or timeout for request ID: {request_id}")
-                raise Exception("No input provided or timeout")
+                logger.warning(f"[TEAM {team_id}] No input provided or timeout for request ID: {request_id}")
+                # Instead of raising an exception, pause the team and save its state
+                logger.info(f"[TEAM {team_id}] Pausing team due to input timeout")
+                state = await self.pause_team(team_id)
+                
+                if state:
+                    # Save the state to a file for later resumption
+                    state_file = f"team_state_{team_id}.json"
+                    try:
+                        async with aiofiles.open(state_file, "w") as f:
+                            await f.write(json.dumps(state))
+                        logger.info(f"[TEAM {team_id}] Team state saved to {state_file}")
+                        return "[PAUSED DUE TO TIMEOUT - STATE SAVED]"
+                    except Exception as e:
+                        logger.error(f"[TEAM {team_id}] Error saving team state to file: {str(e)}")
+                        return "[ERROR: Failed to save team state]"
+                else:
+                    logger.error(f"[TEAM {team_id}] Failed to pause team")
+                    return "[ERROR: Failed to pause team]"
                 
             logger.info(f"[TEAM {team_id}] Received user input: {user_input[:50]}...")
             return user_input
@@ -113,11 +130,29 @@ class TeamManager:
             return "[CANCELLED BY USER]"
         except Exception as e:
             logger.error(f"[TEAM {team_id}] Error getting user input: {str(e)}")
+            
+            # Try to pause the team and save its state
+            try:
+                logger.info(f"[TEAM {team_id}] Attempting to pause team due to error: {str(e)}")
+                state = await self.pause_team(team_id)
+                
+                if state:
+                    # Save the state to a file for later resumption
+                    state_file = f"team_state_{team_id}.json"
+                    async with aiofiles.open(state_file, "w") as f:
+                        await f.write(json.dumps(state))
+                    logger.info(f"[TEAM {team_id}] Team state saved to {state_file} after error")
+                    return "[PAUSED DUE TO ERROR - STATE SAVED]"
+                else:
+                    logger.error(f"[TEAM {team_id}] Failed to pause team after error")
+            except Exception as e2:
+                logger.error(f"[TEAM {team_id}] Error during team pause after input error: {str(e2)}")
+                
             return f"[ERROR: {str(e)}]"
         finally:
             # Clear the request ID
-            if team_id in self._current_request_ids:
-                logger.debug(f"[TEAM {team_id}] Clearing request ID {self._current_request_ids[team_id]}")
+            if team_id in self._current_request_ids and self._current_request_ids[team_id] == request_id:
+                logger.debug(f"[TEAM {team_id}] Clearing request ID {request_id}")
                 self._current_request_ids[team_id] = None
     
     async def get_team(
@@ -424,3 +459,52 @@ class TeamManager:
         else:
             logger.error(f"Failed to save state for team {team_id}")
             return None
+            
+    async def resume_team(self, team_id: str, state_file: Optional[str] = None) -> Tuple[Optional[RoundRobinGroupChat], Optional[ExternalTermination]]:
+        """Resume a team from a saved state.
+        
+        Args:
+            team_id: ID of the team to resume
+            state_file: Optional path to the state file. If not provided, will use team_state_{team_id}.json
+            
+        Returns:
+            A tuple of (team, termination) if successful, or (None, None) if failed
+        """
+        logger.info(f"Attempting to resume team with ID {team_id}")
+        
+        # Check if team already exists
+        async with self._lock:
+            if team_id in self._teams:
+                logger.warning(f"Team {team_id} already exists, cannot resume")
+                return self._teams[team_id]
+        
+        # Determine state file path
+        if not state_file:
+            state_file = f"team_state_{team_id}.json"
+        
+        # Check if state file exists
+        if not os.path.exists(state_file):
+            logger.error(f"State file {state_file} does not exist, cannot resume team {team_id}")
+            return None, None
+        
+        try:
+            # Load state from file
+            logger.debug(f"Loading state from file {state_file}")
+            async with aiofiles.open(state_file, "r") as f:
+                state_json = await f.read()
+                state = json.loads(state_json)
+            
+            # Create a new team
+            logger.debug(f"Creating new team with ID {team_id}")
+            team, termination = await self.get_team(team_id)
+            
+            # Load state into team
+            logger.debug(f"Loading state into team {team_id}")
+            await team.load_state(state)
+            
+            logger.info(f"Successfully resumed team {team_id} from state")
+            return team, termination
+        except Exception as e:
+            logger.error(f"Error resuming team {team_id}: {str(e)}")
+            logger.exception("Detailed exception information:")
+            return None, None

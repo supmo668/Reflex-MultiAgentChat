@@ -126,12 +126,47 @@ class ChatState(rx.State):
         # Get team manager instance
         team_manager = TeamManager.get_instance()
         
-        # After cancellation, we should have a fresh team_id from _reset_team_id()
-        # Log the current team_id for debugging
-        logger.debug(f"Current team_id: {self.team_id}")
+        # Check if there's a saved state for this team (paused chat)
+        state_file = f"team_state_{self.team_id}.json"
+        has_saved_state = os.path.exists(state_file)
+        logger.debug(f"Checking for saved state file {state_file}: exists={has_saved_state}")
         
-        # Always start a new chat after cancellation
-        # We can detect this by checking if the team exists
+        if has_saved_state:
+            # This is a paused chat, try to resume it
+            logger.debug(f"Found saved state for team {self.team_id}, attempting to resume")
+            try:
+                # Resume the team with the saved state
+                team, termination = await team_manager.resume_team(self.team_id, state_file)
+                if team:
+                    logger.debug(f"Successfully resumed team {self.team_id} from saved state")
+                    
+                    # Add a system message indicating resumption
+                    async with self:
+                        resume_message = QA(
+                            content="Chat resumed from saved state.",
+                            source="system",
+                            type="system"
+                        )
+                        self.messages = self.messages + [resume_message]
+                    
+                    # Submit the message to the resumed team
+                    logger.debug(f"Submitting message to resumed team: {message[:30]}...")
+                    success = await team_manager.submit_user_input(self.team_id, message)
+                    
+                    if not success:
+                        logger.error(f"Failed to submit message to resumed team {self.team_id}")
+                        # If submission failed, start a new chat
+                        yield ChatState.start_chat(message)
+                    
+                    return
+                else:
+                    logger.error(f"Failed to resume team {self.team_id} from saved state")
+                    # Continue with normal flow (create new team)
+            except Exception as e:
+                logger.error(f"Error resuming team from saved state: {str(e)}")
+                # Continue with normal flow (create new team)
+        
+        # Check if team is running
         is_running = False
         try:
             is_running = await team_manager.is_team_running(self.team_id)
@@ -141,16 +176,16 @@ class ChatState(rx.State):
             is_running = False
         
         if not is_running:
-            # Force start a new chat if we're after cancellation or no team is running
-            # This ensures we always get a fresh start
+            # Start a new chat if no team is running
             logger.debug(f"Starting new chat with message: '{message[:30]}...'")
             logger.debug("Yielding to start_chat event")
             try:
-                # We need to ensure a fresh team_id
-                async with self:
-                    old_id = self.team_id
-                    self._reset_team_id()
-                    logger.debug(f"Reset team_id from {old_id} to {self.team_id} before starting chat")
+                # We need to ensure a fresh team_id if not resuming from saved state
+                if not has_saved_state:
+                    async with self:
+                        old_id = self.team_id
+                        self._reset_team_id()
+                        logger.debug(f"Reset team_id from {old_id} to {self.team_id} before starting chat")
                 
                 yield ChatState.start_chat(message)
                 logger.debug("Successfully yielded to start_chat")
@@ -395,40 +430,139 @@ class ChatState(rx.State):
 
     @rx.event(background=True)
     async def pause_chat(self):
-        """Pause the current chat by saving its state and removing the team.
+        """Pause the current chat.
         
-        This allows the user to start a new chat while preserving the state of the current one.
+        This will pause the current chat and save its state for later resumption.
         """
+        logger.debug("Pausing chat")
+        
+        # Use TeamManager to pause the team
         team_manager = TeamManager.get_instance()
         
-        # Check if team is running before attempting to pause
-        if await team_manager.is_team_running(self.team_id):
-            # Save the team state
-            state = await team_manager.save_team_state(self.team_id)
+        # Reset UI state
+        async with self:
+            self.processing = False
+            self.input_enabled = True
             
-            # Store the state
+        # Pause the team
+        team_id = self.team_id
+        logger.debug(f"Pausing team with ID {team_id}")
+        
+        try:
+            state = await team_manager.pause_team(team_id)
             if state:
+                logger.debug(f"Team {team_id} paused successfully")
+                
+                # Save state to a file for later resumption
+                state_file = f"team_state_{team_id}.json"
+                try:
+                    async with aiofiles.open(state_file, "w") as f:
+                        await f.write(json.dumps(state))
+                    logger.info(f"Team state saved to {state_file}")
+                    
+                    # Add a message to the UI
+                    async with self:
+                        pause_message = QA(
+                            content=f"Chat paused. State saved to {state_file}.",
+                            source="system",
+                            type="system"
+                        )
+                        self.messages = self.messages + [pause_message]
+                except Exception as e:
+                    logger.error(f"Error saving team state to file: {str(e)}")
+                    
+                    # Add an error message to the UI
+                    async with self:
+                        error_message = QA(
+                            content=f"Chat paused, but failed to save state: {str(e)}",
+                            source="system",
+                            type="system"
+                        )
+                        self.messages = self.messages + [error_message]
+            else:
+                logger.error(f"Failed to pause team {team_id}")
+                
+                # Add an error message to the UI
                 async with self:
-                    self.team_state = state
-                    logger.debug(f"Team state saved: {len(state)} bytes")
+                    error_message = QA(
+                        content="Failed to pause chat. Please try again.",
+                        source="system",
+                        type="system"
+                    )
+                    self.messages = self.messages + [error_message]
+        except Exception as e:
+            logger.error(f"Error pausing team: {str(e)}")
             
-            # Now remove the team to free up resources
-            await team_manager.remove_team(self.team_id)
-            
-            # Add pause message
+            # Add an error message to the UI
             async with self:
-                pause_message = QA(
-                    content="Chat paused. You can continue with a new conversation.",
+                error_message = QA(
+                    content=f"Error pausing chat: {str(e)}",
                     source="system",
                     type="system"
                 )
-                self.messages = self.messages + [pause_message]
-        
-        # Reset processing state regardless of whether team was running
-        async with self:
-            self.processing = False
+                self.messages = self.messages + [error_message]
             self.current_request_id = None
             self.input_enabled = True  # Re-enable input after pausing
+    
+    @rx.event(background=True)
+    async def resume_chat(self):
+        """Resume a paused chat.
+        
+        This will load the saved state of the paused chat and resume it.
+        """
+        logger.debug("Resuming chat")
+        
+        # Use TeamManager to resume the team
+        team_manager = TeamManager.get_instance()
+        
+        # Load the saved state
+        team_id = self.team_id
+        state_file = f"team_state_{team_id}.json"
+        try:
+            async with aiofiles.open(state_file, "r") as f:
+                state = json.loads(await f.read())
+            logger.info(f"Loaded team state from {state_file}")
+        except Exception as e:
+            logger.error(f"Error loading team state from file: {str(e)}")
+            # Add an error message to the UI
+            async with self:
+                error_message = QA(
+                    content=f"Error resuming chat: {str(e)}",
+                    source="system",
+                    type="system"
+                )
+                self.messages = self.messages + [error_message]
+            return
+        
+        try:
+            # Resume the team
+            await team_manager.resume_team(team_id, state)
+            logger.debug(f"Team {team_id} resumed successfully")
+            
+            # Reset UI state
+            async with self:
+                self.processing = True
+                self.input_enabled = False
+                
+            # Add a message to the UI
+            async with self:
+                resume_message = QA(
+                    content="Chat resumed.",
+                    source="system",
+                    type="system"
+                )
+                self.messages = self.messages + [resume_message]
+        except Exception as e:
+            logger.error(f"Error resuming team: {str(e)}")
+            
+            # Add an error message to the UI
+            async with self:
+                error_message = QA(
+                    content=f"Error resuming chat: {str(e)}",
+                    source="system",
+                    type="system"
+                )
+                self.messages = self.messages + [error_message]
     
     @rx.event
     def on_message_input(self, value: str):
